@@ -109,6 +109,27 @@ Generates text from the trained model checkpoint (`out/ckpt.pt`).
 - `max_new_tokens`: 500
 - `num_samples`: 10
 
+**Example output:**
+
+```java
+switch (g) {
+    case G_DEFAULT_TARGET:
+        goto IL_00106;
+        return 0;
+    case G_REQUIRED:
+        goto IL_00103;
+        return 0;
+    // ...
+}
+
+public static O = 0 as Vector2f;
+public static O *= 0 -> Vector2f;
+public static O *= 0 -> (Vector2f + Vector2f) : Vector2f;
+// ...
+```
+
+The model is pre-training on mixed code from 8 languages (Python, Java, JavaScript, TypeScript, Go, C++, Rust, SQL). Output quality depends on training steps and data scale.
+
 ## License
 
 MIT License
