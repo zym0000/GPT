@@ -14,11 +14,11 @@ os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50304
+    vocab_size: int = 64000
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
-    dropout: float = 0.0
+    dropout: float = 0.0 #预训练可以为0，后训练可以增加，防止过拟合
 
 
 class SelfAttention(nn.Module):
@@ -31,19 +31,20 @@ class SelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
+        #flashattention
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             # 广播适配 从最后一维对齐，1,1 可以被扩展到B,T
             self.register_buffer("bias",torch.tril(torch.ones(config.block_size,config.block_size))
                                                .view(1,1,config.block_size,config.block_size))
-    
+
     def forward(self,x):
         B,T,C = x.size()
         qkv = self.c_attn(x)  #(B,T,3C)
 
         q,k,v = qkv.split(self.n_embd,dim=2) #(B,T,C)
 
-        #C是多个head，为了计算这里需要分成多个head C//head
+        #把一个大维度分成多头
         q = q.view(B,T,self.n_head, C//self.n_head).transpose(1,2) #(B,H,T,hs)
         k = k.view(B,T,self.n_head, C//self.n_head).transpose(1,2) #(B,H,T,hs)
         v = v.view(B,T,self.n_head, C//self.n_head).transpose(1,2) #(B,H,T,hs)
@@ -59,6 +60,7 @@ class SelfAttention(nn.Module):
             y = att @ v
 
         y = y.transpose(1,2).contiguous().view(B,T,C)
+        #合并多头学习的数据
         y = self.resid_dropout(self.c_proj(y))
         return y
 
@@ -66,8 +68,15 @@ class SelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
+        #y = x@WT+b
+        # W[4 * config.n_embd, config.n_embd], b[config.n_embd]
+        # [T, config.n_embd] @ [config.n_embd, 4*config.n_embd]
+        # y[B,T, 4*config.n_embd]
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gele = nn.GELU(approximate='tanh')
+        # [T, 4 * config.n_embd] @ W[ 4 * config.n_embd,config.n_embd]
+        #b[config.n_embd]
+        #y[B,T,config.n_embd]
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -101,10 +110,21 @@ class GPTModule(nn.Module):
         super().__init__()
         self.config = config
         self.transformer = nn.ModuleDict(dict(
+            #词表
             wte = nn.Embedding(config.vocab_size,config.n_embd),
+            #位置表
             wpe = nn.Embedding(config.block_size,config.n_embd),
             drop = nn.Dropout(config.dropout),
+            #隐藏层
             h = nn.ModuleList(Block(config) for _ in range(config.n_layer)),
+            # 公式 output = (x - mean) / sqrt(var + eps) * gamma + beta
+            # mean：均值 sum(x) / x.size()
+            # var: 方差  sum((x- mean)^2) / x.size()
+            # x_norm: 标准化 (x - mean) / sqrt(var + eps)
+            # 这两个是可学习参数，训练过程中自动调整
+            # gamma: 缩放因子
+            # beta: 平移因子
+            # 目的: 防止数值爆炸/消失 加速收敛，损失曲面更平滑
             ln_f = nn.LayerNorm(config.n_embd),
         ))
 
@@ -126,21 +146,35 @@ class GPTModule(nn.Module):
 
     def forward(self, idx, targets = None):
         B,T = idx.size()
-
+        #输出参数查表 输出 #[B,T,embd]
         wte_embd = self.transformer.wte(idx)
+        #构建位置索引[0,1,2,3.....T]
         pos = torch.arange(T, dtype = torch.long, device=idx.device)
+        #查表 位置表[T,embd]
         wpe_embd = self.transformer.wpe(pos)
+        #词位信息混合
         x = self.transformer.drop(wte_embd + wpe_embd)
 
         for block in self.transformer.h:
             x = block(x)
+        
+        #归一，防止数值爆炸
         x = self.transformer.ln_f(x)
 
         if targets is None:
             loss = None
+            #embd->vocab_size 投影
             logits = self.lm_head(x)
         else:
             logits = self.lm_head(x)
+            #http://fancyerii.github.io/2025/07/06/nll-ce/#%E8%B4%9F%E5%AF%B9%E6%95%B0%E4%BC%BC%E7%84%B6negative-log-likelihood%E6%8D%9F%E5%A4%B1
+            #交叉损失熵如果是多分类 如果是多标签进行独立二元判断可以使用BCELoss
+            # 使用 logits.view 展平, -1 自动计算剩余维度
+            #cross_entropy 衡量模型预测概率分布与真实分布的差距
+            #第一步: softmax 把最后一个维度 做归一化处理 过程: 把所有数变成正数 e^xi, 求和 Σe^xj 归一 e^xi/Σe^xj
+            #第二步: 根据targets 获取对应的概率大小
+            #第三步: 计算loss 通过负对数似然loss = -log(logits(y)) 对数 把0-1 映射 0~无穷
+            #第四步: 求平均 mean(loss)
             loss = F.cross_entropy(logits.view(-1,logits.size(-1)), targets.view(-1),ignore_index=-1)
 
         return logits,loss
@@ -286,6 +320,13 @@ class GPTModule(nn.Module):
         mfu = flops_achieved / total_peak
         return mfu
     
+    # 评估模型大小
+    def estimate_params(self):
+         total_params = sum(p.numel() for p in self.parameters())
+         dtype = next(self.parameters()).dtype
+         type_size = torch.finfo(dtype).bits // 8 if dtype.is_floating_point else 1
+         print(f"Model size: {total_params * type_size / 1e9:.2f} GB")
+    
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
@@ -312,7 +353,6 @@ class GPTModule(nn.Module):
 
         return idx
     
-
 #简单的 数据加载器
 import tiktoken
 class DataLoad:
