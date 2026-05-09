@@ -1,230 +1,302 @@
 """
 Prepare code pretraining dataset from ModelScope/HF starcoderdata.
-✅ Streaming & Interleaved Pipeline | Peak RAM < 1.5GB | No OOM
+Fixed: SSL/HuggingFace blocked -> Use ModelScope CDN
+Fixed: Precise Val/Train split | Windows Compatible | Robust Buffer Handling
+Added: EOS token appended to every document
 """
 
 import os
 import sys
-sys.path.insert(0, 'C:\\Users\\zym\\AppData\\Local\\pylibs')
+import time
+import traceback
+
+# ===== 全局异常捕获（防止 Windows 终端闪退）=====
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    print("\n未捕获的异常:", flush=True)
+    traceback.print_exception(exc_type, exc_value, exc_traceback)
+    input("\n按回车键退出...")
+
+sys.excepthook = handle_exception
+# =================================================
+
+print(f"脚本启动 [{time.strftime('%H:%M:%S')}]", flush=True)
+
+# 如需本地 pylibs，保留；否则可注释
+sys.path.insert(0, r'C:\\Users\\zym\\AppData\\Local\\pylibs')
+
 import json
-import random
 from tqdm import tqdm
 import numpy as np
-import tiktoken
+
+#从 ModelScope 加载 tokenizer，走国内镜像，绕过 HuggingFace SSL 问题
+from modelscope import AutoTokenizer
 from modelscope.msdatasets import MsDataset
-from datasets import interleave_datasets  # ✅ 流式交错混合核心库
+from datasets import interleave_datasets
 
 # ============================================
 # Configuration
 # ============================================
-TARGET_TOTAL_TOKENS = 10_000_000_000
-VAL_RATIO = 0.0005
+DEBUG_MODE = False  # True=只跑100万token快速验证
+
+if DEBUG_MODE:
+    TARGET_TOTAL_TOKENS = 1_000_000
+    VAL_RATIO = 0.001
+    ESTIMATE_SAMPLES = 50
+    BUFFER_SIZE = 50_000
+else:
+    TARGET_TOTAL_TOKENS = 12_000_000_000
+    VAL_RATIO = 0.001
+    ESTIMATE_SAMPLES = 500
+    BUFFER_SIZE = 500_000
 
 LANG_CONFIG = {
-    "python": 0.35, "java": 0.20, "javascript": 0.10, "typescript": 0.05,
-    "go": 0.10, "c++": 0.10, "rust": 0.05, "sql": 0.05,
+    "python": 0.25,
+    "c": 0.2,
+    "javascript": 0.15,
+    "go": 0.20,
+    "c++": 0.20,
 }
-assert abs(sum(LANG_CONFIG.values()) - 1.0) < 1e-6, "Ratios must sum to 1.0"
+assert abs(sum(LANG_CONFIG.values()) - 1.0) < 1e-6
 
-NAMESPACE = "bigcode"          # HF/ModelScope 命名空间
+NAMESPACE = "bigcode"
 DATASET_NAME = "starcoderdata"
 
-enc = tiktoken.get_encoding("gpt2")
+# ModelScope 上的模型 ID（注意大小写与 HuggingFace 不同）
+ENCODING = "01-ai/Yi-6B"
+
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "code_pretrain_data")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
 SEED = 2357
-random.seed(SEED)
 
-# data_dir 映射 (starcoderdata 按语言分目录存储)
 LANG_FILTER_MAP = {
     "python": "python", "java": "java", "javascript": "javascript",
-    "typescript": "typescript", "go": "go", "c++": "cpp",
-    "rust": "rust", "sql": "sql",
+    "go": "go", "c++": "cpp", "c": "c"
 }
 
-
-def estimate_tokens_per_doc(lang_key: str, n_samples: int = 300):
-    """流式采样估算平均 token 数"""
-    data_dir = LANG_FILTER_MAP[lang_key]
-    ds_stream = MsDataset.load(
-        dataset_name=DATASET_NAME, namespace=NAMESPACE,
-        split="train", data_dir=data_dir, use_streaming=True
+# ============================================
+# Step 0: Load Tokenizer from ModelScope
+# ============================================
+print(f"[{time.strftime('%H:%M:%S')}] 从 ModelScope 加载 tokenizer: {ENCODING} ...", flush=True)
+try:
+    tokenizer = AutoTokenizer.from_pretrained(
+        ENCODING,
+        trust_remote_code=True,
+        use_fast=True
     )
-    
-    total_tokens = 0
-    count = 0
-    for example in ds_stream:
-        text = example.get("content", "") or example.get("text", "")
-        if not text.strip(): continue
-        total_tokens += len(enc.encode_ordinary(text))
-        count += 1
-        if count >= n_samples: break
-        
-    avg = total_tokens / count if count > 0 else 1000
-    print(f"  ✅ [{lang_key}] 采样 {count} 条，平均 {avg:.1f} tokens/doc")
-    return avg
+except Exception as e:
+    print(f"Tokenizer 加载失败: {e}", flush=True)
+    raise
 
+print(f"Tokenizer 加载成功 | vocab_size: {len(tokenizer)}", flush=True)
 
-def token_generator(stream, total_limit=None):
-    """从流式数据集中按需产出 token IDs + EOT"""
-    count = 0
-    for ex in stream:
-        text = ex.get("content", "") or ex.get("text", "")
-        if not text.strip(): continue
-        
-        ids = enc.encode_ordinary(text)
-        ids.append(enc.eot_token)
-        
-        yield ids
-        count += len(ids)
-        if total_limit and count >= total_limit:
-            break
+eos_id = tokenizer.eos_token_id
+if eos_id is None:
+    print("tokenizer 没有 eos_token_id，将不使用 EOS", flush=True)
+else:
+    print(f"EOS token id: {eos_id} ({tokenizer.eos_token})", flush=True)
 
+# ============================================
+# Helper Functions
+# ============================================
 
-def write_binary_streaming(token_stream, output_path: str, max_tokens: int, desc: str):
-    """
-    修复版：增量写入 memmap，避免 resize 报错 + 自动边界截断
-    内存恒定 < 1GB，支持精确/宽松两种模式
-    """
-    # 🔑 预分配时多留 2% 缓冲，避免最后一步越界
-    alloc_size = int(max_tokens * 1.02)
-    arr = np.memmap(output_path, dtype=np.uint16, mode="w+", shape=(alloc_size,))
-    idx = 0
-    buffer = []
-    BUFFER_SIZE = 500_000  # 每 50万 token 刷盘
-    
-    pbar = tqdm(desc=desc, total=max_tokens, unit="tok")
-    
-    for item in token_stream:
-        ids = item if isinstance(item, list) else (item.get("ids") if isinstance(item, dict) else None)
-        if not ids: continue
-            
-        buffer.extend(ids)
-        pbar.update(len(ids))
-        
-        # 达到缓冲阈值 → 刷盘（带边界检查）
-        if len(buffer) >= BUFFER_SIZE:
-            chunk = np.array(buffer, dtype=np.uint16)
-            
-            # 🔑 关键修复：如果剩余空间不足，截断 chunk
-            remaining = max_tokens - idx
-            if remaining <= 0:
-                break
-            if len(chunk) > remaining:
-                chunk = chunk[:remaining]
-                
-            arr[idx:idx+len(chunk)] = chunk
-            idx += len(chunk)
-            buffer = []
-            arr.flush()
-            
-            if idx >= max_tokens:
-                break
-                
-    # 写入剩余部分（同样带边界检查）
-    if buffer and idx < max_tokens:
-        chunk = np.array(buffer, dtype=np.uint16)
-        remaining = max_tokens - idx
-        if len(chunk) > remaining:
-            chunk = chunk[:remaining]
-        arr[idx:idx+len(chunk)] = chunk
-        idx += len(chunk)
-        
-    arr.flush()
-    
-    # 🔑 修复 resize 报错：用 os.ftruncate 直接截断文件，或跳过截断
+def estimate_tokens_per_doc(lang_key: str, n_samples: int = ESTIMATE_SAMPLES):
+    """快速估算平均 token 数，用于预估时间"""
+    data_dir = LANG_FILTER_MAP[lang_key]
+    print(f"  [{time.strftime('%H:%M:%S')}] 估算 {lang_key} (data_dir='{data_dir}')...", flush=True)
     try:
-        # 方法1: 尝试用 ftruncate 截断文件（更可靠）
-        with open(output_path, "r+b") as f:
-            os.ftruncate(f.fileno(), idx * 2)  # uint16 = 2 bytes
-    except Exception as e:
-        # 方法2: 如果失败，跳过截断（训练代码按实际长度读取，多余字节无害）
-        print(f"⚠️ 跳过文件截断: {e}")
-    
-    # 重新加载正确大小的 memmap（可选，确保后续读取安全）
-    final_arr = np.memmap(output_path, dtype=np.uint16, mode="r", shape=(idx,))
-    assert len(final_arr) == idx, f"Final array length mismatch: {len(final_arr)} != {idx}"
-    
-    file_size = os.path.getsize(output_path)
-    print(f"✅ {desc} 完成: {idx:,} tokens, {file_size/1e9:.2f} GB")
-    return idx
-
-
-def main():
-    print("=" * 70)
-    print("🚀 低内存流式代码预训练数据准备")
-    print(f"🎯 目标: {TARGET_TOTAL_TOKENS:,} tokens")
-    print("=" * 70)
-
-    # Step 1: 估算各语言平均长度
-    print("\n📊 Step 1: Estimating tokens per document...")
-    lang_avg_tokens = {}
-    for lang_key in LANG_CONFIG.keys():
-        lang_avg_tokens[lang_key] = estimate_tokens_per_doc(lang_key)
-
-    # Step 2: 初始化各语言流式数据集
-    print("\n🌐 Step 2: Initializing streaming data sources...")
-    streams = []
-    probs = []
-    for lang_key in LANG_CONFIG.keys():
-        data_dir = LANG_FILTER_MAP[lang_key]
-        print(f"  ⏳ 加载 {lang_key} (data_dir='{data_dir}')...")
         ds = MsDataset.load(
             dataset_name=DATASET_NAME, namespace=NAMESPACE,
             split="train", data_dir=data_dir, use_streaming=True
         )
-        
-        # 🔑 核心修复：只保留 content 字段，彻底消除 schema 类型冲突
-        # 兼容 datasets >= 2.14.0，ModelScope 底层基于 HF，完全支持
-        ds = ds.select_columns(["content"])
-        
-        streams.append(ds)
-        probs.append(LANG_CONFIG[lang_key])
+        total_tokens = 0
+        count = 0
+        for example in ds:
+            text = example.get("content", "") or example.get("text", "")
+            if text.strip():
+                total_tokens += len(tokenizer.encode(text, add_special_tokens=False))
+                total_tokens += 1 if eos_id is not None else 0
+                count += 1
+                if count >= n_samples:
+                    break
+        avg = total_tokens / count if count > 0 else 1000
+        print(f"  [{lang_key}] Avg tokens/doc (w/ EOS): {avg:.1f}", flush=True)
+        return avg
+    except Exception as e:
+        print(f"  [{lang_key}] Estimate failed: {e}", flush=True)
+        return 1000
 
-    # Step 3: 按概率交错混合 (内置小窗口 shuffle)
-    print("\n🔀 Step 3: Interleaving datasets by language ratio...")
+def write_buffer_to_memmap(arr, buffer, idx, max_idx):
+    """将 buffer 写入 memmap,处理边界截断"""
+    if not buffer:
+        return idx, []
+    
+    chunk = np.array(buffer, dtype=np.uint16)
+    remaining = max_idx - idx
+    
+    if remaining <= 0:
+        return idx, []
+    
+    if len(chunk) > remaining:
+        chunk_to_write = chunk[:remaining]
+        remaining_buffer = chunk[remaining:].tolist()
+    else:
+        chunk_to_write = chunk
+        remaining_buffer = []
+        
+    arr[idx : idx + len(chunk_to_write)] = chunk_to_write
+    arr.flush()
+    return idx + len(chunk_to_write), remaining_buffer
+
+def main():
+    print("=" * 70, flush=True)
+    print("Code Pretrain Data Prep (ModelScope CDN + EOS Version)", flush=True)
+    print(f"Target: {TARGET_TOTAL_TOKENS:,} tokens", flush=True)
+    print(f"Debug mode: {DEBUG_MODE}", flush=True)
+    print(f"EOS token: {eos_id}", flush=True)
+    print("=" * 70, flush=True)
+
+    # Step 1: Estimate
+    print(f"\n[{time.strftime('%H:%M:%S')}] Step 1: Estimating...", flush=True)
+    for lang in LANG_CONFIG:
+        estimate_tokens_per_doc(lang)
+
+    # Step 2: Load Streams
+    print(f"\n[{time.strftime('%H:%M:%S')}] Step 2: Loading streams from ModelScope...", flush=True)
+    streams = []
+    probs = []
+    for lang_key in LANG_CONFIG:
+        data_dir = LANG_FILTER_MAP[lang_key]
+        print(f"  [{time.strftime('%H:%M:%S')}] Loading {lang_key} (data_dir='{data_dir}')...", flush=True)
+        
+        try:
+            ds = MsDataset.load(
+                dataset_name=DATASET_NAME, namespace=NAMESPACE,
+                split="train", data_dir=data_dir, use_streaming=True
+            )
+            ds = ds.select_columns(["content"])
+            streams.append(ds)
+            probs.append(LANG_CONFIG[lang_key])
+            print(f"  {lang_key} stream loaded", flush=True)
+        except Exception as e:
+            print(f"  {lang_key} 加载失败: {e}", flush=True)
+            raise
+
+    print(f"[{time.strftime('%H:%M:%S')}] Interleaving {len(streams)} streams...", flush=True)
     mixed_stream = interleave_datasets(
-        streams,
-        probabilities=probs,
-        seed=SEED,
-        stopping_strategy="first_exhausted"
+        streams, probabilities=probs, seed=SEED, stopping_strategy="first_exhausted"
     )
+    print(f"Interleave done", flush=True)
 
-    # Step 4: 划分 Val / Train 并写入
+    # Step 3: Prepare Files
     val_target = int(TARGET_TOTAL_TOKENS * VAL_RATIO)
     train_target = TARGET_TOTAL_TOKENS - val_target
     
-    # 创建一个全局 token 迭代器（先写 val，再写 train，无缝衔接）
-    token_iter = token_generator(mixed_stream, total_limit=val_target + train_target)
-    
-    val_path = os.path.join(OUTPUT_DIR, "val.bin")
+    alloc_factor = 1.06 
     train_path = os.path.join(OUTPUT_DIR, "train.bin")
+    val_path = os.path.join(OUTPUT_DIR, "val.bin")
     
-    print("\n💾 Step 4: Writing binary files...")
-    val_actual = write_binary_streaming(token_iter, val_path, val_target, "Writing Val")
-    train_actual = write_binary_streaming(token_iter, train_path, train_target, "Writing Train")
+    print(f"\n[{time.strftime('%H:%M:%S')}] Step 3: Writing memmap files...", flush=True)
+    print(f"   Val Target:   {val_target:,}", flush=True)
+    print(f"   Train Target: {train_target:,}", flush=True)
+    print(f"   Output dir:   {OUTPUT_DIR}", flush=True)
 
-    # 保存元数据
-    metadata = {
+    print(f"   Pre-allocating val memmap ({int(val_target * alloc_factor * 2 / 1e6):.0f} MB)...", flush=True)
+    arr_val = np.memmap(val_path, dtype=np.uint16, mode='w+', shape=(int(val_target * alloc_factor)))
+    
+    print(f"   Pre-allocating train memmap ({int(train_target * alloc_factor * 2 / 1e9):.2f} GB)...", flush=True)
+    arr_train = np.memmap(train_path, dtype=np.uint16, mode='w+', shape=(int(train_target * alloc_factor)))
+    print(f"   Memmap ready", flush=True)
+
+    idx_val = 0
+    idx_train = 0
+    buf_val = []
+    buf_train = []
+    
+    pbar = tqdm(total=TARGET_TOTAL_TOKENS, desc="Total Tokens", unit="tok")
+    
+    n_docs = 0
+    print(f"[{time.strftime('%H:%M:%S')}] Starting iteration...", flush=True)
+    
+    for ex in mixed_stream:
+        text = ex.get("content", "") or ex.get("text", "")
+        if not text.strip(): 
+            continue
+        
+        if len(text) > 500_000: 
+            continue 
+        
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        
+        # ==================== EOS ====================
+        if eos_id is not None:
+            ids.append(eos_id)
+        # =============================================
+        
+        n_tok = len(ids)
+        n_docs += 1
+        
+        if idx_val < val_target:
+            buf_val.extend(ids)
+            if len(buf_val) >= BUFFER_SIZE:
+                idx_val, buf_val = write_buffer_to_memmap(arr_val, buf_val, idx_val, val_target)
+        else:
+            if idx_train < train_target:
+                buf_train.extend(ids)
+                if len(buf_train) >= BUFFER_SIZE:
+                    idx_train, buf_train = write_buffer_to_memmap(arr_train, buf_train, idx_train, train_target)
+            else:
+                break
+                
+        pbar.update(n_tok)
+        
+        if n_docs % 1000 == 0:
+            pbar.write(f"[{time.strftime('%H:%M:%S')}] Processed {n_docs:,} docs | val={idx_val:,} | train={idx_train:,}")
+        
+        if idx_val >= val_target and idx_train >= train_target:
+            break
+
+    # Flush remaining buffers
+    idx_val, _ = write_buffer_to_memmap(arr_val, buf_val, idx_val, val_target)
+    idx_train, _ = write_buffer_to_memmap(arr_train, buf_train, idx_train, train_target)
+    
+    pbar.close()
+
+    # Step 4: Finalize Files
+    print(f"\n[{time.strftime('%H:%M:%S')}] Step 4: Finalizing files...", flush=True)
+    
+    del arr_val
+    del arr_train
+    
+    for path, final_idx in [(val_path, idx_val), (train_path, idx_train)]:
+        actual_size = final_idx * 2
+        try:
+            with open(path, "r+b") as f:
+                f.truncate(actual_size)
+        except Exception as e:
+            print(f"Truncate warning for {path}: {e}", flush=True)
+            
+    print(f"   Val:   {idx_val:,} tokens ({os.path.getsize(val_path)/1e6:.2f} MB)", flush=True)
+    print(f"   Train: {idx_train:,} tokens ({os.path.getsize(train_path)/1e9:.2f} GB)", flush=True)
+
+    # Save Metadata
+    meta = {
         "target_total_tokens": TARGET_TOTAL_TOKENS,
-        "actual_train_tokens": int(train_actual),
-        "actual_val_tokens": int(val_actual),
+        "actual_train_tokens": int(idx_train),
+        "actual_val_tokens": int(idx_val),
         "language_config": LANG_CONFIG,
-        "dataset": f"{NAMESPACE}/{DATASET_NAME}",
-        "tokenizer": "gpt2",
+        "tokenizer": ENCODING,
         "seed": SEED,
-        "pipeline": "streaming_interleave_memmap"
+        "add_eos": eos_id is not None,
+        "eos_token_id": eos_id,
+        "debug_mode": DEBUG_MODE
     }
     with open(os.path.join(OUTPUT_DIR, "metadata.json"), "w") as f:
-        json.dump(metadata, f, indent=2)
-
-    print(f"\n{'='*70}")
-    print("✅ 全部完成！内存峰值 < 1.5GB")
-    print(f"📊 Train: {train_actual:,} tokens ({os.path.getsize(train_path)/1e9:.2f} GB)")
-    print(f"📊 Val:   {val_actual:,} tokens ({os.path.getsize(val_path)/1e6:.2f} MB)")
-    print(f"{'='*70}")
-
+        json.dump(meta, f, indent=2)
+        
+    print(f"\n[{time.strftime('%H:%M:%S')}] Done!", flush=True)
 
 if __name__ == "__main__":
     main()
