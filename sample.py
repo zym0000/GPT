@@ -5,8 +5,14 @@ import os
 import pickle
 from contextlib import nullcontext
 import torch
-import tiktoken
+#import tiktoken
 from model import GPTConfig, GPTModule
+
+import sys
+sys.path.insert(0, r'C:\\Users\\zym\\AppData\\Local\\pylibs')
+
+
+from modelscope import AutoTokenizer
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
@@ -34,7 +40,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # model
 if init_from == 'resume':
     # init from a model saved in a specific directory
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_path = os.path.join(out_dir, 'base.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     gptconf = GPTConfig(**checkpoint['model_args'])
     model = GPTModule(gptconf)
@@ -69,9 +75,13 @@ if load_meta:
 else:
     # ok let's assume gpt-2 encodings by default
     print("No meta.pkl found, assuming GPT-2 encodings...")
-    enc = tiktoken.get_encoding("gpt2")
-    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+    enc = AutoTokenizer.from_pretrained("01-ai/Yi-6B", trust_remote_code=True,
+        use_fast=True)
+    encode = lambda s: enc.encode(s,add_special_tokens=False)
     decode = lambda l: enc.decode(l)
+    #enc = tiktoken.get_encoding("01-ai/Yi-6B")
+    #encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+    #decode = lambda l: enc.decode(l)
 
 # encode the beginning of the prompt
 if start.startswith('FILE:'):
