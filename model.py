@@ -208,13 +208,13 @@ class SelfAttention(nn.Module):
         C = base_linear.in_features
 
         expected_shape = (3 * C, C)
-        assert c_attn_weight.shape == expected_shape,             f"权重形状不匹配: {c_attn_weight.shape} != {expected_shape}"
+        assert c_attn_weight.shape == expected_shape,f"权重形状不匹配: {c_attn_weight.shape} != {expected_shape}"
 
         q_w, k_w, v_w = c_attn_weight.chunk(3, dim=0)
         q_b = k_b = v_b = None
         if c_attn_bias is not None:
             expected_bias_shape = (3 * C,)
-            assert c_attn_bias.shape == expected_bias_shape,                 f"bias 形状不匹配: {c_attn_bias.shape} != {expected_bias_shape}"
+            assert c_attn_bias.shape == expected_bias_shape,f"bias 形状不匹配: {c_attn_bias.shape} != {expected_bias_shape}"
             q_b, k_b, v_b = c_attn_bias.chunk(3, dim=0)
 
         # 修复：zip 顺序与名称严格对应 [q, k, v]
