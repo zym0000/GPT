@@ -215,7 +215,7 @@ if compile:
     print("compiling the model... (takes a ~minute)")
     model = torch.compile(model) # requires PyTorch 2.0
 
-raw_model.estimate_params()
+orig_model.estimate_params()
 
 #train.py loop
 running_mfu = -1.0
