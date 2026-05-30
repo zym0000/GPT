@@ -122,7 +122,7 @@ class LoRALinear(nn.Module):
         out = self.linear(x) #out shape ->(in_embd, out_embd)
         if self.rank > 0:
             #lora_shape -> 
-            lora_out = self.lora_B(self.lora_A(self.dropout(x)))
+            lora_out = self.lora_B(self.dropout(self.lora_A(x)))
             out = out + lora_out * self.scaling
         return out
 
@@ -325,9 +325,7 @@ class GPTModule(nn.Module):
         special_param = []
 
         for n, p in dict_param.items():
-            if 'wte' in n or 'wpe' in n:
-                special_param.append(p)
-            elif p.dim() >= 2:
+            if p.dim() >= 2:
                 decay_param.append(p)
             else:
                 nodecay_param.append(p)
@@ -335,7 +333,6 @@ class GPTModule(nn.Module):
         optim_groups = [
             {'params': decay_param, 'weight_decay': weight_decay,'lr':learning_rate},
             {'params': nodecay_param, 'weight_decay':0.0, 'lr':learning_rate},
-            {'params': special_param, 'weight_decay':0.01, 'lr': learning_rate* 0.1} #学习率的10%,可以参考下动态学习曲线调整
         ]
 
         try:
@@ -363,7 +360,7 @@ class GPTModule(nn.Module):
         if 'A10' in gpu_name: return 'A10'
         if '4090' in gpu_name: return 'RTX4090'
         if '4060' in gpu_name: return 'RTX4060'
-        return 'A100'  # 默认
+        return 'Unknown'  # 默认
     
     def get_num_params(self, non_embedding=True):
         """
@@ -373,8 +370,9 @@ class GPTModule(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+        #ROPE 替代 wpe embedding
+        # if non_embedding:
+        #     n_params -= self.transformer.wpe.weight.numel()
         return n_params
     
     def estimate_mfu(self, fwdbwd_per_iter, dt, world_size=None):
@@ -429,10 +427,10 @@ class GPTModule(nn.Module):
     
     # 评估模型大小
     def estimate_params(self):
-         total_params = sum(p.numel() for p in self.parameters())
-         dtype = next(self.parameters()).dtype
-         type_size = torch.finfo(dtype).bits // 8 if dtype.is_floating_point else 1
-         print(f"Model size: {total_params * type_size / 1e9:.2f} GB")
+        total_params = sum(p.numel() for p in self.parameters())
+        param_size = sum(p.numel() * p.element_size() for p in self.parameters())
+        print(f"Parameters: {total_params / 1e6:.2f} M")
+        print(f"Model size: {param_size / 1e9:.2f} GB (parameters only)")
     
     def generate(self, idx, max_new_tokens, temperature=0.2, top_k=None, eos_token_id=None):
         """
@@ -462,7 +460,7 @@ class GPTModule(nn.Module):
                         print(f"  idx_cond min/max: {idx_cond.min()}/{idx_cond.max()}")
                         print(f"  idx_cond shape: {idx_cond.shape}")
                         # 检查 embedding 层
-                        emb = self.transformer.wte(idx_cond)
+                        emb = self.wte(idx_cond)
                         print(f"  emb nan: {torch.isnan(emb).any()}")
                         # 直接 argmax 一个安全值，避免崩溃
                         idx_next = torch.zeros((idx.size(0), 1), dtype=torch.long, device=idx.device)
