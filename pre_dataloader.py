@@ -45,7 +45,7 @@ def pre_train_data_loader_best_fit(
     code_col="content",
     nl_col="text",
     resume_state_dict=None,
-    code_ratio=0.85,
+    code_ratio=0.75,
     seed=42,
 ):
     FIM_PREFIX_ID, FIM_SUFFIX_ID, FIM_MIDDLE_ID = tokenizer.get_fim_ids()
@@ -93,7 +93,7 @@ def pre_train_data_loader_best_fit(
     document_iter = mixed_document_batches(
         split=split,
         resume_state_dict=resume_state_dict,      # 如需断点续训，从外部传入
-        tokenizer_batch_size=1024,   # 每次读取一批原始文本
+        tokenizer_batch_size=256,   # 每次读取一批原始文本
         code_dir=code_dir,
         nl_dir=nl_dir,
         code_col=code_col,
@@ -103,25 +103,37 @@ def pre_train_data_loader_best_fit(
     )
     
     # 状态变量（用于保存 checkpoint）
-    pq_idx, rg_idx, epoch = 0, 0, 1
+    #pq_idx, rg_idx, epoch = 0, 0, 1
+    last_resume_state = None
     doc_buffer = []
     weights_buffer = []
 
     def refill_buffer():
-        nonlocal pq_idx, rg_idx, epoch
+        #nonlocal pq_idx, rg_idx, epoch
+        nonlocal last_resume_state
 
         doc_batch, indices = next(document_iter)
         
         # 解包状态（混合迭代器返回 dict）
-        pq_idx = indices["pq_idx"]
-        rg_idx = indices["rg_idx"]
-        epoch = indices["epoch"]
+        #pq_idx = indices["pq_idx"]
+        #rg_idx = indices["rg_idx"]
+        #epoch = indices["epoch"]
+        last_resume_state = indices.get("resume_state")
+
+         # 文本级来源标记
+        text_sources = indices.get("text_sources")
         
         # 判断当前 batch 来源：代码 or NL
-        is_code = (indices.get("source") == "code")
+        #is_code = (indices.get("source") == "code")
         # 分词
         token_list = tokenizer.get_doc_batch_tokens(doc_batch)
-        for tokens in token_list:
+        for i, tokens in enumerate(token_list):
+            if text_sources:
+                is_code = (text_sources[i] == "code")
+            else:
+                # 兜底：老格式或没标记时，全按 code 处理
+                is_code = False
+                print(f"text_sources is None")
             chunks = sliding_window_split(tokens, T - 4)
             total_size = len(tokens)
             for chunk_token, chunk_start in chunks:
@@ -162,7 +174,7 @@ def pre_train_data_loader_best_fit(
                     pos += doc_len
                 else:
                     # 这里为了保证FIM完整性，不使用截断，使用填充 因为input 不能为 -1 -100这种特殊,所以填充0
-                    #mask 用来标记是否是填充，来表示哪些不参与计算。
+                    #mask 用来标记是否是填充，来表示哪些不参与计算
                     row_buffer[row_idx, pos:pos+remaining] = torch.full((remaining,),0,dtype=torch.long)
                     pos += remaining
 
@@ -170,8 +182,13 @@ def pre_train_data_loader_best_fit(
         targets_tmp = row_buffer[:, 1:].clone()
         targets_tmp[mask[:, 1:]] = -1
         cpu_targets.copy_(targets_tmp)
-        
-        state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
+        if last_resume_state is None:
+            last_resume_state = {
+                "code": {"pq_idx": 0, "rg_idx": None, "epoch": 1},
+                "nl": {"pq_idx": 0, "rg_idx": None, "epoch": 1},
+            }
+        #state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
+        state_dict = last_resume_state
 
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
         yield inputs, targets, state_dict
