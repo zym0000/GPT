@@ -71,7 +71,7 @@ def load_checkpoint(checkpoint_dir, step,device, load_optimzer = False, rank =0)
     optimizer_data = None
     if load_optimzer:
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank}.pt")
-        optimizer_data  = torch.load(optimizer_data,map_location=device)
+        optimizer_data  = torch.load(optimizer_path,map_location=device)
 
     meta_path = os.path.join(checkpoint_dir,f"meta_{step:06d}.json")
     with open(meta_path, "r", encoding="utf-8") as f:
@@ -88,13 +88,12 @@ eval_only = False # if True, script exits right after the first eval
 init_from = args.init_from # 'scratch' or 'resume'
 resume = init_from == 'resume'
 #learing_rate
-max_lr = 6e-4
-min_lr = max_lr * 0.1
-warmup_steps = 600
-max_steps = 6000
+max_lr = 4e-4
+min_lr = max_lr * 0.05
+warmup_steps = 1000
+max_steps = 10000
 
 #data
-dataset = 'code_pretrain_data'
 batch_size = args.device_batch_size
 block_size = args.max_seq_len
 #adawm optiomzer
@@ -106,19 +105,19 @@ learning_rate = max_lr
 
 #model 270M 可以改变数值 改变模型大小
 # N = 20 * P  训练数据一般模型大小的20倍。
-n_layer = 12
+n_layer = 32
 n_head = 16
-n_embd = 1024 #1536
+n_embd = 1024
 dropout = 0.1
 
 #system
 device = 'cuda' 
 
 grad_clip = 1.0
-max_iters = 6000
+max_iters = 10000
 compile = args.compile
 #所有ddp 一次看到处理的token
-total_batch_size = 524288#0.5M: data one step data size
+total_batch_size = 524288#0.5M * 4: data one step data size
 
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -206,7 +205,7 @@ if ddp:
 scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
-optimizer = model.configure_optimizer(weight_decay, learning_rate, (beta1, beta2), device_type)
+optimizer = orig_model.configure_optimizer(weight_decay, learning_rate, (beta1, beta2), device_type)
 if resume:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
@@ -225,6 +224,7 @@ code_dir = "data/code"
 nl_dir = "data/nl"
 
 dataloader_resume_state_dict = None if not resume else meta_data["dataloader_state_dict"]
+print0(f"dataloader_resume_state_dict: {dataloader_resume_state_dict}")
 train_loader = pre_train_data_loader_best_fit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", 
                                               device=device, 
                                               code_dir=code_dir,
@@ -345,8 +345,8 @@ while True:
     tok_per_sec = int(total_batch_size / dt)
     mfu = orig_model.estimate_mfu(batch_size * accumulation_steps, dt,ddp_world_size)
     running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-    epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step} | loss: {debiased_smooth_loss:.6f} | lr: {lr:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m")
+    epoch = f"dataloader_state_dict:{dataloader_state_dict}"
+    print0(f"step {step} | loss: {debiased_smooth_loss:.6f} | lr: {lr:.6f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m")
 
     step += 1
 
