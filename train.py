@@ -27,10 +27,10 @@ parser.add_argument("--mode", type=str, default="code", choices=["code", "wiki",
                     help="训练模式: code=代码预训练, wiki=中文语料, fineweb=英文语料")
 parser.add_argument("-c ","--compile",type=bool, default=False,help="enable compile model")
 parser.add_argument('-b',"--device-batch-size",type=int,default=1,help="device per batch")
-parser.add_argument('-s',"--max-seq-len",type=int,default=1024,help="device per seq size")
+parser.add_argument('-s',"--max-seq-len",type=int,default=2048,help="device per seq size")
 parser.add_argument('-i',"--init-from",type=str,default="scratch",help="train mode 'scratch' or 'resume' or 'gpt2*'")
 parser.add_argument("--save-every",type= int,default=1000,help="train save step")
-parser.add_argument("--eval-step", type= int, default = 200, help="train eval step")
+parser.add_argument("--eval-step", type= int, default = 400, help="train eval step")
 parser.add_argument("--resume-from-step",type=int, default=-1 ,help="resume training from this step (-1 = disable)")
 args = parser.parse_args()
 #-----------------------------------------------------
@@ -90,8 +90,8 @@ resume = init_from == 'resume'
 #learing_rate
 max_lr = 4e-4
 min_lr = max_lr * 0.05
-warmup_steps = 1000
-max_steps = 10000
+warmup_steps = 3000
+max_steps = 100000
 
 #data
 batch_size = args.device_batch_size
@@ -114,7 +114,7 @@ dropout = 0.1
 device = 'cuda' 
 
 grad_clip = 1.0
-max_iters = 10000
+max_iters = max_steps
 compile = args.compile
 #所有ddp 一次看到处理的token
 total_batch_size = 524288#0.5M * 4: data one step data size
@@ -174,10 +174,10 @@ if resume:
     checkpoint_dir = os.path.join(out_dir, 'base.pt')
     model_data,optimizer_data,meta_data = load_checkpoint(out_dir,args.resume_from_step,device_type,True,ddp_rank)
     #state_dict = model_data['model']
-    # unwanted_prefix = '_orig_mod.'
-    # for k,v in list(state_dict.items()):
-    #     if k.startswith(unwanted_prefix):
-    #         state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(model_data.items()):
+        if k.startswith(unwanted_prefix):
+            model_data[k[len(unwanted_prefix):]] = model_data.pop(k)
     model.load_state_dict(model_data)
     step = meta_data['step']
     batch_size = meta_data['device_batch_size']
@@ -199,20 +199,24 @@ torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 model.to(device)
 orig_model = model
 
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
-#精度缩放，主要针对float16，在训练的过程中，指数部分精度降低
-scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
-
 # optimizer
 optimizer = orig_model.configure_optimizer(weight_decay, learning_rate, (beta1, beta2), device_type)
 if resume:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
 
+torch._dynamo.reset()
+
 if compile:
     print("compiling the model... (takes a ~minute)")
     model = torch.compile(model) # requires PyTorch 2.0
+
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+#精度缩放，主要针对float16，在训练的过程中，指数部分精度降低
+scaler = torch.amp.GradScaler(enabled=(dtype == 'float16')) if dtype == 'float16' else None
+
+torch.cuda.empty_cache()
 
 orig_model.estimate_params()
 
@@ -239,7 +243,7 @@ x, y, dataloader_state_dict = next(train_loader) # kick off load of the very fir
 ema_beta = 0.9
 total_training_time = 0
 
-min_bpb = float("-inf")
+min_bpb = float("inf")
 
 #使用动态学习曲线，为了加速收敛，增强训练稳定性，提高模型的泛化能力
 def get_lr(step):
@@ -313,17 +317,24 @@ while True:
             train_loss = loss.detach()
             loss = loss / accumulation_steps
         #require_backward_grad_sync 决定是否同步，默认为TRUE，避免频繁同步，这里在最后一步进行同步
-        scaler.scale(loss).backward()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
         x, y,dataloader_state_dict = next(train_loader)
     
     #normal = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm= 1.0)
     # 梯度裁剪，避免loss剧烈震荡
     if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
+        if scaler is not None:
+            scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
+    if scaler is not None:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
     # flush the gradients as soon as we can, no need for this memory anymore
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item()
