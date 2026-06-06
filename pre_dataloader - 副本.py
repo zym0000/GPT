@@ -105,12 +105,37 @@ def pre_train_data_loader_best_fit(
     # 状态变量（用于保存 checkpoint）
     #pq_idx, rg_idx, epoch = 0, 0, 1
     last_resume_state = None
-    doc_buffer = []
-    weights_buffer = []
+    #doc_buffer = []
+    #weights_buffer = []
+    BUCKET_SIZE = 64
+    num_buckets = (T + BUCKET_SIZE ) // BUCKET_SIZE
+    buckets = [[] for _ in range(num_buckets)]
+    bucket_total = 0
+
+    def add_to_bucket(doc):
+        nonlocal bucket_total
+        idx = min(len(doc) // BUCKET_SIZE,num_buckets - 1)
+        buckets[idx].append(doc)
+        bucket_total +=1
+
+    def pop_best_fit(remaining):
+        nonlocal bucket_total
+        start_bucket = min(remaining // BUCKET_SIZE, num_buckets - 1)
+        for idx in range(start_bucket, -1, -1):
+            i = 0
+            while i < len(buckets[idx]):
+                doc = buckets[idx][i]
+                if len(doc) <= remaining:
+                    buckets[idx].pop(i)
+                    bucket_total -= 1
+                    return doc
+                i += 1
+        return None 
+
 
     def refill_buffer():
         #nonlocal pq_idx, rg_idx, epoch
-        nonlocal last_resume_state
+        nonlocal last_resume_state,bucket_total
 
         doc_batch, indices = next(document_iter)
         
@@ -138,7 +163,7 @@ def pre_train_data_loader_best_fit(
             total_size = len(tokens)
             for chunk_token, chunk_start in chunks:
                 fim_token = apply_fim_to_document(chunk_token, is_code=is_code)
-                doc_buffer.append(fim_token)
+                add_to_bucket(fim_token)
 
     row_capacity = T + 1
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
@@ -148,27 +173,18 @@ def pre_train_data_loader_best_fit(
     cpu_targets = cpu_buffer[B*T:].view(B, T)
     inputs = gpu_buffer[:B*T].view(B, T)
     targets = gpu_buffer[B*T:].view(B, T)
-    mask = torch.ones((B, row_capacity), dtype=torch.bool) 
+    mask = torch.ones((B, row_capacity), dtype=torch.bool)
     while True:
         mask.fill_(True)
         for row_idx in range(B):
+            while bucket_total < buffer_size:
+                refill_buffer()
+
             pos = 0
             while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-                
                 remaining = row_capacity - pos
-                
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
+                doc = pop_best_fit(remaining)
+                if doc is not None:
                     doc_len = len(doc)
                     row_buffer[row_idx,pos:pos+doc_len] = torch.tensor(doc, dtype=torch.long)
                     mask[row_idx,pos:pos+doc_len] = False
@@ -178,6 +194,26 @@ def pre_train_data_loader_best_fit(
                     #mask 用来标记是否是填充，来表示哪些不参与计算
                     row_buffer[row_idx, pos:pos+remaining] = torch.full((remaining,),0,dtype=torch.long)
                     pos += remaining
+
+                # best_idx = -1
+                # best_len = 0
+                # for i, doc in enumerate(doc_buffer):
+                #     doc_len = len(doc)
+                #     if doc_len <= remaining and doc_len > best_len:
+                #         best_idx = i
+                #         best_len = doc_len
+
+                # if best_idx >= 0:
+                #     doc = doc_buffer.pop(best_idx)
+                #     doc_len = len(doc)
+                #     row_buffer[row_idx,pos:pos+doc_len] = torch.tensor(doc, dtype=torch.long)
+                #     mask[row_idx,pos:pos+doc_len] = False
+                #     pos += doc_len
+                # else:
+                #     # 这里为了保证FIM完整性，不使用截断，使用填充 因为input 不能为 -1 -100这种特殊,所以填充0
+                #     #mask 用来标记是否是填充，来表示哪些不参与计算
+                #     row_buffer[row_idx, pos:pos+remaining] = torch.full((remaining,),0,dtype=torch.long)
+                #     pos += remaining
 
         cpu_inputs.copy_(row_buffer[:, :-1])
         targets_tmp = row_buffer[:, 1:].clone()
